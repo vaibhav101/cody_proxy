@@ -99,10 +99,8 @@ app.post("/chat/completions", async (req, res) => {
       sgBody.max_tokens = max_tokens;
     }
 
-    var tstream = false;
-
     // Decide SSE or not
-    if (tstream) {
+    if (stream) {
       log("POST /v1/chat/completions => Using streaming SSE");
       sgBody.stream = true;
 
