@@ -74,60 +74,76 @@ app.get("/v1/models", async (req, res) => {
 app.post("/chat/completions", async (req, res) => {
   try {
     log("POST /v1/chat/completions => Request body:", req.body);
-
     const { model, messages, temperature, max_tokens, stream } = req.body;
 
-    const codyRequest = { model, messages, temperature, max_tokens, stream };
-
-    const url = `${CODY_ENDPOINT}/.api/llm/chat/completions`;
-
     if (stream) {
-        log("POST /v1/chat/completions => Streaming mode active");
+      log("POST /v1/chat/completions => Streaming mode active");
+      const url = `${CODY_ENDPOINT}/.api/llm/chat/completions`;
 
-        res.setHeader("Content-Type", "text/event-stream");
-        res.setHeader("Cache-Control", "no-cache");
-        res.setHeader("Connection", "keep-alive");
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
 
-        const codyResponse = await fetch(url, {
+      const codyResponse = await fetch(url, {
         method: "POST",
         headers: {
-            Authorization: `token ${CODY_ACCESS_TOKEN}`,
-            Accept: "text/event-stream",
-            "X-Requested-With": "proxy 1.0",
+          Authorization: `token ${CODY_ACCESS_TOKEN}`,
+          Accept: "text/event-stream",
+          "X-Requested-With": "proxy 1.0",
+          "Content-Type": "application/json"
         },
         body: JSON.stringify({
-            model,
-            messages,
-            temperature,
-            max_tokens,
-            stream: true,
+          model: req.body.model,
+          messages: req.body.messages,
+          temperature: req.body.temperature,
+          max_tokens: 4000,
+          stream: true,
         }),
-        });
+      });
 
-        log("POST /v1/chat/completions => Cody SSE status:", codyResponse.status);
-
-        if (!codyResponse.ok) {
+      if (!codyResponse.ok) {
         const errText = await codyResponse.text();
-        log("POST /v1/chat/completions => SSE Error:", errText);
-        return res.status(codyResponse.status).send(errText);
-        }
+        log("[ERROR] Cody returned error status:", codyResponse.status, errText);
+        res.status(codyResponse.status).end(errText);
+        return;
+      }
 
-        const reader = codyResponse.body.getReader();
-        const decoder = new TextDecoder();
+      const reader = codyResponse.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buffer = "";
 
-        while (true) {
+      while (true) {
         const { value, done } = await reader.read();
         if (done) {
-            log("[SSE] Cody stream ended.");
-            break;
+          log("[SSE] Cody stream ended.");
+          break;
         }
 
         const chunkText = decoder.decode(value, { stream: true });
         log("[SSE chunk from Cody]", chunkText);
-        res.write(chunkText);
-        }
 
-        res.end();
+        // Properly parse and forward each SSE event separately
+        buffer += chunkText;
+        let boundary = buffer.indexOf("\n\n");
+        while (boundary !== -1) {
+          const fullEvent = buffer.substring(0, boundary).trim();
+          buffer = buffer.substring(boundary + 2); // Remove the parsed event from buffer
+
+          if (fullEvent) {
+            res.write(`${fullEvent}\n\n`);
+          }
+
+          boundary = buffer.indexOf("\n\n");
+        }
+      }
+
+      // If anything is left in the buffer, flush it as final event
+      if (buffer.trim()) {
+        res.write(buffer.trim() + "\n\n");
+      }
+
+      res.write("data: [DONE]\n\n");
+      res.end();
 
     } else {
       log("POST /v1/chat/completions => Non-streaming request");
@@ -170,6 +186,7 @@ app.post("/chat/completions", async (req, res) => {
       log("POST /v1/chat/completions => Final response to client:", JSON.stringify(result));
       res.json(result);
     }
+
   } catch (error) {
     log("POST /v1/chat/completions => Exception:", error);
     res.status(500).json({ error: "Internal server error processing chat completion" });
