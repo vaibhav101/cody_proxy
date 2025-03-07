@@ -1,150 +1,228 @@
+/*******************************************************
+ * server.js - minimal Node 20 proxy with logs
+ * 
+ * Logging for:
+ *   - inbound requests
+ *   - Sourcegraph fetch calls
+ *   - SSE chunks from Sourcegraph
+ *******************************************************/
 const express = require("express");
-const axios = require("axios");
 
 const app = express();
-app.use(express.json()); // for parsing JSON request bodies
+app.use(express.json());
 
-// Load env variables
-const SRC_ENDPOINT = process.env.SRC_ENDPOINT;           // e.g. https://my-sourcegraph-instance.com
-const SRC_ACCESS_TOKEN = process.env.SRC_ACCESS_TOKEN;   // your Sourcegraph token
+// Environment variables
+const SRC_ENDPOINT = process.env.SRC_ENDPOINT;        // e.g. "https://my-sourcegraph-instance.com"
+const SRC_ACCESS_TOKEN = process.env.SRC_ACCESS_TOKEN;
+const PORT = process.env.PORT || 5000;
 
-// ----------------------------------------------------------------------
-// 1) Implement GET /v1/models by calling Cody's .api/llm/models
-// ----------------------------------------------------------------------
+// Helper function for logs
+function log(...args) {
+  console.log("[LOG]", ...args);
+}
+
+// -----------------------------------------------------
+// GET /v1/models
+// -----------------------------------------------------
 app.get("/v1/models", async (req, res) => {
   try {
-    //  Forward to Sourcegraph's /llm/models
-    const sgResp = await axios.get(`${SRC_ENDPOINT}/.api/llm/models`, {
+    log("GET /v1/models => Received request.");
+
+    // Call Sourcegraph
+    const url = `${SRC_ENDPOINT}/.api/llm/models`;
+    log("GET /v1/models => Forwarding to Sourcegraph:", url);
+
+    const sgResp = await fetch(url, {
+      method: "GET",
       headers: {
-        Accept: "application/json",
         Authorization: `token ${SRC_ACCESS_TOKEN}`,
-        'X-Requested-With': 'something 1.0',
+        Accept: "application/json",
+        "X-Requested-With": "something 1.0",
       },
     });
+    log("GET /v1/models => Sourcegraph responded with status:", sgResp.status);
 
-    // Transform Sourcegraph model list into OpenAI style
-    // Sourcegraph returns: { data: [ { id, object, created, owned_by } ] }
-    // OpenAI returns something like: { object: "list", data: [ { id, object, created, owned_by } ] }
-    // Actually it's *almost identical*, so minimal transformation needed:
-    const transformed = {
+    if (!sgResp.ok) {
+      const errText = await sgResp.text();
+      log("GET /v1/models => Sourcegraph error body:", errText);
+      return res.status(sgResp.status).send(errText);
+    }
+
+    const data = await sgResp.json();
+    log("GET /v1/models => Sourcegraph JSON data:", data);
+
+    // Transform to OpenAI style
+    const result = {
       object: "list",
-      data: sgResp.data.data.map((m) => ({
+      data: data.data.map((m) => ({
         id: m.id,
-        object: m.object,    // "model"
+        object: m.object, // usually "model"
         created: m.created,
-        owned_by: m.owned_by
+        owned_by: m.owned_by,
       })),
     };
-    // send it back
-    return res.json(transformed);
-  } catch (err) {
-    console.error("Error in /v1/models:", err?.response?.data || err.message);
-    return res.status(500).json({ error: "Failed to list models from Sourcegraph" });
+
+    log("GET /v1/models => Sending back to client:", result);
+    res.json(result);
+
+  } catch (error) {
+    log("GET /v1/models => Exception:", error);
+    res.status(500).json({ error: "Failed to list models from Sourcegraph" });
   }
 });
 
-// ----------------------------------------------------------------------
-// 2) Implement POST /v1/chat/completions
-// ----------------------------------------------------------------------
+// -----------------------------------------------------
+// POST /v1/chat/completions
+// -----------------------------------------------------
 app.post("/chat/completions", async (req, res) => {
   try {
-    // The user is sending something like
-    // {
-    //   model: "gpt-4",
-    //   messages: [{ role: "user", content: "Hello" }],
-    //   temperature: 0.7, ...
-    // }
+    log("POST /v1/chat/completions => Received request body:", req.body);
 
-    // In Sourcegraph’s /llm/chat/completions, the expected body is:
-    // {
-    //   "messages": [ { role: "...", content: "..." } ],
-    //   "model": "...",
-    //   "max_tokens": 1000,
-    //   ...
-    // }
-
-        console.log("POST /chat/completions", req.body);
-
-    // 1) read relevant fields from the OpenAI request
+    // Destructure
     const {
       model,
       messages,
       temperature,
       max_tokens,
-      // ... other fields you want
+      stream,
     } = req.body;
 
-    // 2) build the Sourcegraph request body
+    // Build the request body for Sourcegraph
     const sgBody = {
-      model: model, // e.g. "anthropic::2023-06-01::claude-3.5-sonnet"
-      messages: messages,
+      model,
+      messages,
     };
-    if (max_tokens) {
-      sgBody.max_tokens = max_tokens; 
-    }
-    if (temperature !== undefined) {
+    if (typeof temperature !== "undefined") {
       sgBody.temperature = temperature;
     }
+    if (typeof max_tokens !== "undefined") {
+      sgBody.max_tokens = max_tokens;
+    }
 
-    // 3) make the request
-    const sgResp = await axios.post(
-      `${SRC_ENDPOINT}/.api/llm/chat/completions`,
-      sgBody,
-      {
+    var tstream = false;
+
+    // Decide SSE or not
+    if (tstream) {
+      log("POST /v1/chat/completions => Using streaming SSE");
+      sgBody.stream = true;
+
+      // Set SSE headers
+      res.setHeader("Content-Type", "text/event-stream");
+      res.setHeader("Cache-Control", "no-cache");
+      res.setHeader("Connection", "keep-alive");
+
+      const url = `${SRC_ENDPOINT}/.api/llm/chat/completions`;
+      log("POST /v1/chat/completions => Forwarding SSE to Sourcegraph:", url);
+
+      // Request SSE from Sourcegraph
+      const sgResp = await fetch(url, {
+        method: "POST",
         headers: {
+          "Authorization": `token ${SRC_ACCESS_TOKEN}`,
           "Content-Type": "application/json",
-          Authorization: `token ${SRC_ACCESS_TOKEN}`,
-          "X-Requested-With": 'something 1.0',
+          "Accept": "text/event-stream",
+          "X-Requested-With": "something 1.0",
         },
+        body: JSON.stringify(sgBody),
+      });
+      log("POST /v1/chat/completions => Sourcegraph SSE status:", sgResp.status);
+
+      if (!sgResp.ok) {
+        const errText = await sgResp.text();
+        log("POST /v1/chat/completions => Sourcegraph SSE error body:", errText);
+        res.status(sgResp.status);
+        return res.end(errText);
       }
-    );
 
-    // 4) transform the Sourcegraph response to OpenAI style
-    // Sourcegraph returns something like:
-    // {
-    //   id, model, object, usage, ...
-    //   choices: [
-    //       { message: { role, content }, finish_reason, index }
-    //   ]
-    // }
-    // We want to produce the standard OpenAI "chat.completion" shape:
-    // {
-    //   id, object: "chat.completion", created, model, usage, choices: [...]
-    // }
+      // Stream it chunk-by-chunk
+      const reader = sgResp.body.getReader();
+      const decoder = new TextDecoder();
 
-    const codyData = sgResp.data; // The raw Sourcegraph response
-    const openAIResponse = {
-      id: codyData.id,
-      object: "chat.completion",
-      created: codyData.created || Math.floor(Date.now()/1000),
-      model: codyData.model,
-      usage: codyData.usage,
-      choices: (codyData.choices || []).map((choice, i) => ({
-        index: i,
-        message: {
-          role: choice.message?.role,
-          content: choice.message?.content,
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) {
+          log("POST /v1/chat/completions => SSE done reading from Sourcegraph");
+          break;
+        }
+        // decode chunk
+        const chunkText = decoder.decode(value, { stream: true });
+
+        // LOG the raw chunk text
+        log("[SSE chunk from SG]", chunkText);
+
+        // SSE format we return: "data: <line>\n\n"
+        const lines = chunkText.split("\n");
+        for (const line of lines) {
+          if (line.trim()) {
+            res.write(`data: ${line}\n\n`);
+          }
+        }
+      }
+
+      // Send final SSE done
+      res.write("data: [DONE]\n\n");
+      res.end();
+
+    } else {
+      log("POST /v1/chat/completions => Non-streaming request");
+      const url = `${SRC_ENDPOINT}/.api/llm/chat/completions`;
+      log("POST /v1/chat/completions => Forwarding to Sourcegraph:", url);
+
+      const sgResp = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Authorization": `token ${SRC_ACCESS_TOKEN}`,
+          "Content-Type": "application/json",
+          "X-Requested-With": "something 1.0",
         },
-        finish_reason: choice.finish_reason || "stop",
-      })),
-    };
+        body: JSON.stringify(sgBody),
+      });
+      log("POST /v1/chat/completions => Sourcegraph status:", sgResp.status);
 
-    // 5) return it
-    console.log("POST /chat/completions response:", openAIResponse);
-    return res.json(openAIResponse);
+      if (!sgResp.ok) {
+        const errText = await sgResp.text();
+        log("POST /v1/chat/completions => Sourcegraph error body:", errText);
+        return res.status(sgResp.status).send(errText);
+      }
 
+      const data = await sgResp.json();
+      log("POST /v1/chat/completions => Sourcegraph JSON data:", data);
+
+      // Convert Sourcegraph response to OpenAI-like shape
+      const nowSec = Math.floor(Date.now() / 1000);
+      const result = {
+        id: data.id || "temp-id",
+        object: "chat.completion",
+        created: data.created || nowSec,
+        model: data.model,
+        usage: data.usage,
+        choices: (data.choices || []).map((c, idx) => {
+            log("POST /v1/chat/completions => choice", idx, c);
+            return ({
+                index: idx,
+                message: {
+                    role: c.message?.role,
+                    content: c.message?.content,
+                },
+                finish_reason: c.finish_reason || "stop",
+            });
+        }),
+      };
+
+      // deep stringify and log
+    log("POST /v1/chat/completions => final response to client:", JSON.stringify(result));
+      return res.json(result);
+    }
   } catch (err) {
-    console.error("Error in /v1/chat/completions:", err?.response?.data || err.message);
-    return res.status(500).json({ error: "Failed to create chat completion from Sourcegraph" });
+    log("POST /v1/chat/completions => exception:", err);
+    res.status(500).json({ error: "Failed to create chat completion from Sourcegraph" });
   }
 });
 
-// OPTIONAL: If your local clients call /v1/completions, implement similarly
-// app.post("/v1/completions", ... )
-
+// --------------------------------------------
 // Start the server
-console.log('Something something');
-const PORT = process.env.PORT || 5000;
+// --------------------------------------------
 app.listen(PORT, () => {
-  console.log(`OpenAI-compatible local server listening on port ${PORT}`);
+  console.log(`[INFO] Node server listening on port ${PORT}`);
+  console.log(`[INFO] Forwarding requests to Sourcegraph at ${SRC_ENDPOINT}`);
 });
