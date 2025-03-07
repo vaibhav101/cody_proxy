@@ -15,9 +15,11 @@ app.use(express.json());
 const CODY_ENDPOINT = process.env.CODY_ENDPOINT || "https://your-cody-instance.com";
 const CODY_ACCESS_TOKEN = process.env.CODY_ACCESS_TOKEN || "your-cody-access-token";
 const PORT = process.env.PORT || 5000;
+const ENABLE_LOGGING = false;
 
 // Helper function for logging
 function log(...args) {
+  if (!ENABLE_LOGGING) return;
   console.log("[LOG]", ...args);
 }
 
